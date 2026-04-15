@@ -1,0 +1,964 @@
+SET search_path TO DBMS_RTDS_PROJECT;
+
+-- 1) Find all scheduled trains between two given stations in a specific time window with route and type details.
+SELECT 
+    t.train_id,
+    t.train_name,
+    t.train_type,
+    r.route_name,
+    sch.starting_ts,
+    sch.ending_ts,
+    src.station_name AS source_station,
+    dst.station_name AS destination_station
+FROM schedule sch
+JOIN train t       ON sch.train_id       = t.train_id
+JOIN route r       ON t.route_id         = r.route_id
+JOIN station src   ON sch.source_station_id      = src.station_id
+JOIN station dst   ON sch.destination_station_id = dst.station_id
+WHERE src.station_id = 'ST001'  -- New Delhi Railway Station
+  AND dst.station_id = 'ST004'  -- Mumbai Central
+  AND sch.starting_ts BETWEEN '2026-04-15 00:00:00' 
+                          AND '2026-04-16 23:59:59'
+  AND sch.status = 'Scheduled'
+ORDER BY sch.starting_ts;
+
+-- 2) Show full booking, passenger, timing, and fare details for a given PNR including trip status.
+SELECT 
+    tk.pnr,
+    ru.name  AS passenger_name,
+    ru.email,
+    ru.phone,
+    tr.train_name,
+    tr.train_type,
+    s_src.station_name  AS boarding_station,
+    s_src.city          AS from_city,
+    s_dst.station_name  AS destination_station,
+    s_dst.city          AS to_city,
+    sch.starting_ts     AS journey_start,
+    sch.ending_ts       AS journey_end,
+    ((EXTRACT(EPOCH FROM (sch.ending_ts - sch.starting_ts)) / 3600))::NUMERIC(5,2) AS journey_hours,
+    tk.passenger_count,
+    p.amount            AS ticket_fare,
+    p.method            AS payment_method,
+    p.payment_time,
+    CASE 
+        WHEN sch.starting_ts > CURRENT_TIMESTAMP THEN 'Upcoming'
+        WHEN sch.ending_ts  < CURRENT_TIMESTAMP THEN 'Completed'
+        ELSE 'In Progress'
+    END AS trip_status
+FROM tickets tk
+JOIN registered_user ru 
+    ON tk.user_id = ru.user_id
+JOIN payment p
+    ON tk.transaction_id = p.transaction_id
+JOIN schedule sch
+    ON tk.schedule_train_id = sch.train_id
+   AND tk.schedule_starting_ts = sch.starting_ts
+JOIN train tr
+    ON tr.train_id = sch.train_id
+JOIN station s_src
+    ON tk.boarding_station = s_src.station_id
+JOIN station s_dst
+    ON tk.destination_station = s_dst.station_id
+WHERE tk.pnr = 'PNR15001';
+
+-- 3) Perform a complete booking transaction: insert payment, ticket, and passenger records atomically.
+BEGIN;
+
+INSERT INTO payment (transaction_id, amount, method)
+VALUES ('TXN91002', 4650.00, 'UPI');
+
+INSERT INTO tickets (
+    pnr,
+    user_id,
+    transaction_id,
+    boarding_station,
+    destination_station,
+    schedule_train_id,
+    schedule_starting_ts,
+    passenger_count
+)
+VALUES (
+    'PNR19102',
+    'U002',
+    'TXN91002',
+    'ST001',   -- New Delhi
+    'ST004',   -- Mumbai Central
+    'TR001',
+    '2026-04-21 16:30:00',
+    2
+);
+
+INSERT INTO passenger (
+    passenger_id,
+    pnr,
+    train_id,
+    coach_code,
+    seat_number,
+    name,
+    gender,
+    dob,
+    berth_pref
+)
+VALUES
+    ('P19002A', 'PNR19102', 'TR001', 'A1', '3', 'Sample Person 1', 'Male',   '1998-01-01', 'Lower'),
+    ('P19002B', 'PNR19102', 'TR001', 'A1', '2', 'Sample Person 2', 'Female', '1997-03-15', 'Upper');
+
+COMMIT;
+
+-- 4) Insert a refund record for a cancelled ticket with reason code and refund amount.
+INSERT INTO ticket_refund (
+    refund_id,
+    pnr,
+    reason_code,
+    refund_amount
+)
+VALUES (
+    'RF19002',
+    'PNR19002',
+    'USER_CANCEL',
+    4000.00
+);
+
+-- 5) Show available seats and per-seat price for each coach of a specific scheduled train.
+WITH seat_occupancy AS (
+    SELECT
+        p.train_id,
+        p.coach_code,
+        COUNT(*) AS booked_seats
+    FROM passenger p
+    JOIN tickets tk
+        ON tk.pnr = p.pnr
+    WHERE tk.schedule_train_id  = 'TR001'
+      AND tk.schedule_starting_ts = '2026-04-21 16:30:00'
+    GROUP BY p.train_id, p.coach_code
+)
+SELECT 
+    c.train_id,
+    t.train_name,
+    c.coach_type,
+    CASE WHEN c.ac_flag THEN 'AC' ELSE 'Non-AC' END AS ac_status,
+    c.coach_code,
+    c.total_seats,
+    COALESCE(so.booked_seats, 0) AS booked_seats,
+    c.total_seats - COALESCE(so.booked_seats, 0) AS available_seats,
+    t.base_fare,
+    tc.class_name,
+    tc.fare_multiplier,
+    (t.base_fare * tc.fare_multiplier * c.fare_multiplier)::NUMERIC(10,2) AS price_per_seat
+FROM coach c
+JOIN train t       ON t.train_id = c.train_id
+JOIN train_class tc ON tc.class_id = t.class_id
+LEFT JOIN seat_occupancy so
+    ON so.train_id = c.train_id
+   AND so.coach_code = c.coach_code
+WHERE c.train_id = 'TR001'
+ORDER BY c.coach_code;
+
+-- 6) List all bookings of a user showing departure time and whether the trip is past or upcoming.
+SELECT
+    tk.pnr,
+    ru.user_id,
+    ru.name       AS user_name,
+    tr.train_name,
+    bs.station_name AS from_station,
+    ds.station_name AS to_station,
+    tk.schedule_starting_ts AS departure,
+    tk.booking_ts,
+    tk.passenger_count,
+    CASE
+        WHEN tk.schedule_starting_ts > CURRENT_TIMESTAMP THEN 'Upcoming'
+        ELSE 'Past'
+    END AS trip_status
+FROM tickets tk
+JOIN registered_user ru 
+    ON ru.user_id = tk.user_id
+JOIN schedule sch
+    ON sch.train_id = tk.schedule_train_id
+   AND sch.starting_ts = tk.schedule_starting_ts
+JOIN train tr
+    ON tr.train_id = sch.train_id
+JOIN station bs
+    ON bs.station_id = tk.boarding_station
+JOIN station ds
+    ON ds.station_id = tk.destination_station
+WHERE ru.user_id = 'U001'
+ORDER BY tk.schedule_starting_ts DESC;
+
+-- 7) Fetch basic profile details of a registered user by user id or email.
+SELECT
+    user_id,
+    name,
+    email,
+    dob,
+    address,
+    phone
+FROM registered_user
+WHERE user_id = 'U001'
+   OR email   = 'baburao.apte@comedy.com';
+
+-- 8) Find upcoming trips for a specific passenger identified by name and date of birth.
+SELECT
+    p.pnr,
+    p.passenger_id,
+    p.name          AS passenger_name,
+    p.gender,
+    p.dob,
+    tk.user_id,
+    tr.train_name,
+    st_src.station_name AS boarding_station,
+    st_dst.station_name AS destination_station,
+    tk.schedule_starting_ts AS departure
+FROM passenger p
+JOIN tickets tk
+    ON tk.pnr = p.pnr
+JOIN schedule sch
+    ON sch.train_id = tk.schedule_train_id
+   AND sch.starting_ts = tk.schedule_starting_ts
+JOIN train tr
+    ON tr.train_id = sch.train_id
+JOIN station st_src
+    ON st_src.station_id = tk.boarding_station
+JOIN station st_dst
+    ON st_dst.station_id = tk.destination_station
+WHERE p.name = 'Sample Person 1'
+  AND p.dob  = DATE '1998-01-01'
+  AND tk.schedule_starting_ts >= CURRENT_TIMESTAMP
+ORDER BY tk.schedule_starting_ts;
+
+-- 9) From Ahmedabad, find stations in same division or zone that have no direct scheduled train.
+WITH ahd AS (
+    SELECT
+        st.station_id       AS ahd_id,
+        st.division_id      AS ahd_division_id,
+        d.zone_id           AS ahd_zone_id
+    FROM station st
+    JOIN division d
+        ON d.division_id = st.division_id
+    WHERE st.station_name = 'Ahmedabad Junction'
+    LIMIT 1
+),
+same_area_stations AS (
+    SELECT
+        st.station_id,
+        st.station_name,
+        st.city,
+        st.division_id,
+        d.zone_id
+    FROM station st
+    JOIN division d
+        ON d.division_id = st.division_id
+    CROSS JOIN ahd
+    WHERE st.station_id <> ahd.ahd_id
+      AND (
+            st.division_id = ahd.ahd_division_id
+         OR d.zone_id      = ahd.ahd_zone_id
+      )
+),
+direct_pairs AS (
+    SELECT DISTINCT
+        sch.destination_station_id AS dest_id
+    FROM schedule sch
+    JOIN ahd
+        ON sch.source_station_id = ahd.ahd_id
+)
+SELECT
+    s.station_id,
+    s.station_name,
+    s.city
+FROM same_area_stations s
+LEFT JOIN direct_pairs dp
+    ON dp.dest_id = s.station_id
+WHERE dp.dest_id IS NULL
+ORDER BY s.station_name
+LIMIT 5;
+
+-- 10) Find stations that appear as source stations but never as destinations in any schedule.
+SELECT
+    s.station_id,
+    s.station_name,
+    s.city,
+    COUNT(*) AS times_as_source
+FROM station s
+JOIN schedule sch
+    ON sch.source_station_id = s.station_id
+LEFT JOIN schedule sch2
+    ON sch2.destination_station_id = s.station_id
+GROUP BY s.station_id, s.station_name, s.city
+HAVING COUNT(sch2.destination_station_id) = 0
+ORDER BY times_as_source DESC;
+
+-- 11) Calculate average speed for each route using total distance and average journey hours.
+WITH route_times AS (
+    SELECT
+        r.route_id,
+        r.route_name,
+        r.total_distance,
+        AVG(
+            EXTRACT(EPOCH FROM (sch.ending_ts - sch.starting_ts)) / 3600
+        ) AS avg_hours
+    FROM route r
+    JOIN train t
+        ON t.route_id = r.route_id
+    JOIN schedule sch
+        ON sch.train_id = t.train_id
+    GROUP BY r.route_id, r.route_name, r.total_distance
+)
+SELECT
+    route_id,
+    route_name,
+    total_distance,
+    avg_hours,
+    CASE
+        WHEN avg_hours > 0 THEN
+            ROUND(
+                (total_distance / avg_hours)::numeric
+            , 2)
+        ELSE NULL
+    END AS avg_speed_kmph
+FROM route_times
+ORDER BY avg_speed_kmph DESC NULLS LAST;
+
+-- 12) Show per-day bookings, cancellations, and cancellation percentage over time.
+WITH daily_booking AS (
+    SELECT
+        DATE(booking_ts) AS booking_date,
+        COUNT(DISTINCT pnr) AS total_bookings
+    FROM tickets
+    GROUP BY DATE(booking_ts)
+),
+daily_refund AS (
+    SELECT
+        refund_date,
+        COUNT(DISTINCT pnr) AS cancelled_bookings
+    FROM ticket_refund
+    GROUP BY refund_date
+)
+SELECT
+    b.booking_date,
+    b.total_bookings,
+    COALESCE(r.cancelled_bookings, 0) AS cancelled_bookings,
+    ROUND(
+        COALESCE(r.cancelled_bookings, 0)::NUMERIC /
+        NULLIF(b.total_bookings, 0) * 100
+    , 2) AS cancellation_rate_percent
+FROM daily_booking b
+LEFT JOIN daily_refund r
+    ON r.refund_date = b.booking_date
+ORDER BY b.booking_date DESC;
+
+-- 13) List users having a specific date of birth, ordered by name.
+SELECT
+    user_id,
+    name,
+    email,
+    dob,
+    address,
+    phone
+FROM registered_user
+WHERE dob = DATE '2004-01-13'
+ORDER BY name;
+
+-- 14) Detect passengers whose same name and DOB appear under multiple user accounts.
+SELECT
+    p.name,
+    p.dob,
+    ARRAY_AGG(DISTINCT tk.user_id) AS user_ids,
+    COUNT(DISTINCT tk.user_id)     AS distinct_users,
+    COUNT(DISTINCT tk.pnr)         AS total_bookings
+FROM passenger p
+JOIN tickets tk
+    ON tk.pnr = p.pnr
+GROUP BY p.name, p.dob
+HAVING COUNT(DISTINCT tk.user_id) > 1
+ORDER BY total_bookings DESC;
+
+-- 15) Find users whose ticket cancellation rate is at least fifty percent of their bookings.
+WITH user_bookings AS (
+    SELECT 
+        ru.user_id,
+        ru.name,
+        ru.email,
+        COUNT(DISTINCT tk.pnr)          AS total_bookings,
+        COUNT(DISTINCT trf.refund_id)   AS cancelled_bookings,
+        ROUND(
+            (COUNT(DISTINCT trf.refund_id)::NUMERIC /
+             NULLIF(COUNT(DISTINCT tk.pnr), 0)) * 100
+        , 2) AS cancellation_rate
+    FROM registered_user ru
+    LEFT JOIN tickets tk
+        ON ru.user_id = tk.user_id
+    LEFT JOIN ticket_refund trf
+        ON trf.pnr = tk.pnr
+    GROUP BY ru.user_id, ru.name, ru.email
+)
+SELECT 
+    user_id,
+    name,
+    email,
+    total_bookings,
+    cancelled_bookings,
+    cancellation_rate
+FROM user_bookings
+WHERE cancellation_rate >= 50
+ORDER BY cancellation_rate DESC;
+
+-- 16) Detect one-hour time slots where a user makes many bookings within that hour.
+WITH per_hour AS (
+    SELECT
+        user_id,
+        date_trunc('hour', booking_ts) AS hour_slot,
+        COUNT(*) AS bookings_in_hour
+    FROM tickets
+    GROUP BY user_id, date_trunc('hour', booking_ts)
+)
+SELECT
+    user_id,
+    hour_slot,
+    bookings_in_hour
+FROM per_hour
+WHERE bookings_in_hour >= 1
+ORDER BY bookings_in_hour DESC, hour_slot;
+
+-- 17) Compute average delay and report count for each route based on live status data.
+SELECT
+    s.route_id,
+    r.route_name,
+    ROUND(AVG(l.delay_minutes)::NUMERIC, 2) AS avg_delay_minutes,
+    COUNT(*) AS reports
+FROM live_train_status l
+JOIN schedule s
+    ON s.train_id    = l.schedule_train_id
+   AND s.starting_ts = l.schedule_starting_ts
+JOIN route r
+    ON r.route_id = s.route_id
+GROUP BY s.route_id, r.route_name
+ORDER BY avg_delay_minutes DESC;
+
+-- 18) Find the top five busiest boarding stations by number of boardings and passengers.
+SELECT
+    st.station_id,
+    st.station_name,
+    st.city,
+    st.category,
+    st.is_junction,
+    COUNT(*) AS total_boardings,
+    SUM(tk.passenger_count) AS total_passengers
+FROM station st
+JOIN tickets tk
+    ON tk.boarding_station = st.station_id
+GROUP BY st.station_id, st.station_name, st.city, st.category, st.is_junction
+ORDER BY total_boardings DESC
+LIMIT 5;
+
+-- 19) Show all stations in a city with their division, zone, and junction/regular type.
+SELECT
+    st.station_id,
+    st.station_name,
+    st.category,
+    CASE WHEN st.is_junction THEN 'Junction' ELSE 'Regular' END AS station_type,
+    d.division_name,
+    z.zone_name
+FROM station st
+JOIN division d
+    ON d.division_id = st.division_id
+JOIN zone z
+    ON z.zone_id = d.zone_id
+WHERE st.city = 'Mumbai'
+ORDER BY st.is_junction DESC, st.station_name;
+
+-- 20) Summarize coach composition per train by coach type, count, and total seats.
+SELECT
+    c.train_id,
+    t.train_name,
+    c.coach_type,
+    COUNT(*)           AS num_coaches,
+    SUM(c.total_seats) AS total_seats
+FROM coach c
+JOIN train t
+    ON t.train_id = c.train_id
+GROUP BY c.train_id, t.train_name, c.coach_type
+ORDER BY c.train_id, c.coach_type;
+
+-- 21) Count for each junction station how many distinct routes pass through it.
+SELECT
+    st.station_id,
+    st.station_name,
+    st.city,
+    COUNT(DISTINCT rs.route_id) AS routes_passing_through
+FROM station st
+JOIN route_station rs
+    ON rs.station_id = st.station_id
+WHERE st.is_junction = TRUE
+GROUP BY st.station_id, st.station_name, st.city
+ORDER BY routes_passing_through DESC;
+
+-- 22) Update a staff member’s division, zone, and station to reflect a transfer.
+UPDATE staff s
+SET
+    division_id = 'D004',
+    zone_id     = d.zone_id,
+    station_id  = 'ST020'
+FROM division d
+WHERE d.division_id = 'D004'
+  AND s.staff_id    = 'S110';
+
+-- 23) Show a staff member’s role, salary, contact, station, division, and zone.
+SELECT
+    s.staff_id,
+    s.name,
+    s.role,
+    s.salary,
+    s.phone,
+    s.email,
+    st.station_name,
+    st.city,
+    d.division_name,
+    z.zone_name
+FROM staff s
+LEFT JOIN station st
+    ON st.station_id = s.station_id
+JOIN division d
+    ON d.division_id = s.division_id
+JOIN zone z
+    ON z.zone_id = s.zone_id
+WHERE s.staff_id = 'S101';
+
+-- 24) Count staff per department and division to understand organizational spread.
+SELECT
+    dept.dept_name,
+    div.division_name,
+    COUNT(*) AS staff_count
+FROM staff s
+JOIN department dept
+    ON dept.dept_id = s.dept_id
+JOIN division div
+    ON div.division_id = s.division_id
+GROUP BY dept.dept_name, div.division_name
+ORDER BY dept.dept_name, staff_count DESC;
+
+-- 25) Show salary statistics (min, max, avg, stddev) and high earners per department.
+SELECT 
+    d.dept_name,
+    COUNT(*)                         AS total_staff,
+    ROUND(AVG(s.salary)::NUMERIC,2)  AS avg_salary,
+    MIN(s.salary)::NUMERIC(10,2)     AS min_salary,
+    MAX(s.salary)::NUMERIC(10,2)     AS max_salary,
+    ROUND(STDDEV(s.salary)::NUMERIC,2) AS salary_stddev,
+    COUNT(CASE WHEN s.salary > 100000 THEN 1 END) AS high_earners
+FROM department d
+LEFT JOIN staff s
+    ON s.dept_id = d.dept_id
+GROUP BY d.dept_id, d.dept_name
+ORDER BY avg_salary DESC NULLS LAST;
+
+-- 26) List all ticket checkers posted at a specific station with their fine logs.
+SELECT
+    st.station_id,
+    st.station_name,
+    tc.staff_id,
+    s.name  AS staff_name,
+    s.role,
+    tc.fine_log
+FROM ticket_checker tc
+JOIN staff s
+    ON s.staff_id = tc.staff_id
+JOIN station st
+    ON st.station_id = tc.station_id
+WHERE st.station_id = 'ST001'
+ORDER BY staff_name;
+
+-- 27) Show driver and guard assignments per train, including schedule start times.
+SELECT 
+    t.train_id,
+    t.train_name,
+    sch.starting_ts,
+    r.route_name,
+    drv.staff_id        AS driver_id,
+    s_drv.name          AS driver_name,
+    drv.driving_license_no,
+    grd.staff_id        AS guard_id,
+    s_grd.name          AS guard_name,
+    grd.security_clearance
+FROM train t
+JOIN route r
+    ON r.route_id = t.route_id
+LEFT JOIN schedule sch
+    ON sch.train_id = t.train_id
+LEFT JOIN driver drv
+    ON drv.train_id = t.train_id
+LEFT JOIN staff s_drv
+    ON s_drv.staff_id = drv.staff_id
+LEFT JOIN guard grd
+    ON grd.train_id = t.train_id
+LEFT JOIN staff s_grd
+    ON s_grd.staff_id = grd.staff_id
+ORDER BY t.train_id, sch.starting_ts DESC NULLS LAST;
+
+-- 28) Summarize for each locomotive its shed, division, maintenance count, and days since last service.
+SELECT 
+    l.loco_id,
+    l.loco_class,
+    l.status,
+    ms.shed_name,
+    d.division_name,
+    COUNT(mr.maintenance_id) AS maintenance_records,
+    MAX(mr.maintenance_date) AS last_service_date,
+    CURRENT_DATE - MAX(mr.maintenance_date) AS days_since_service
+FROM locomotive l
+LEFT JOIN maintenance_shed ms
+    ON ms.shed_id = l.shed_id
+LEFT JOIN division d
+    ON d.division_id = ms.division_id
+LEFT JOIN train t
+    ON t.loco_id = l.loco_id
+LEFT JOIN maintenance_record mr
+    ON mr.train_id = t.train_id
+GROUP BY l.loco_id, l.loco_class, l.status, ms.shed_name, d.division_name
+ORDER BY days_since_service DESC NULLS LAST;
+
+-- 29) List all locomotives that are not Active, grouped by zone, division, and shed.
+SELECT 
+    z.zone_name,
+    d.division_name,
+    ms.shed_name,
+    l.loco_id,
+    l.loco_class,
+    l.status
+FROM locomotive l
+JOIN maintenance_shed ms
+    ON ms.shed_id = l.shed_id
+JOIN division d
+    ON d.division_id = ms.division_id
+JOIN zone z
+    ON z.zone_id = d.zone_id
+WHERE l.status <> 'Active'
+ORDER BY z.zone_name, d.division_name, ms.shed_name, l.loco_id;
+
+-- 30) Show the inventory of locomotives assigned to a particular maintenance shed.
+SELECT 
+    ms.shed_id,
+    ms.shed_name,
+    ms.shed_type,
+    l.loco_id,
+    l.loco_class,
+    l.status
+FROM maintenance_shed ms
+LEFT JOIN locomotive l
+    ON l.shed_id = ms.shed_id
+WHERE ms.shed_id = 'SH001'
+ORDER BY l.loco_id;
+
+-- 31) Identify trains with no maintenance record or maintenance older than a given interval.
+SELECT
+    t.train_id,
+    t.train_name,
+    CASE
+        WHEN MAX(mr.maintenance_date) IS NULL THEN 'NO_RECORD'
+        WHEN MAX(mr.maintenance_date) < CURRENT_DATE - INTERVAL '1 months'
+             THEN 'OLD_RECORD'
+        ELSE 'OK'
+    END AS compliance_status,
+    MAX(mr.maintenance_date) AS last_maintenance
+FROM train t
+LEFT JOIN maintenance_record mr
+    ON mr.train_id = t.train_id
+GROUP BY t.train_id, t.train_name
+HAVING MAX(mr.maintenance_date) IS NULL
+    OR MAX(mr.maintenance_date) < CURRENT_DATE - INTERVAL '1 months'
+ORDER BY compliance_status, t.train_id;
+
+-- 32) Compute total bookings, passengers, and revenue generated for each train.
+SELECT
+    tr.train_id,
+    tr.train_name,
+    COUNT(DISTINCT tk.pnr)      AS total_bookings,
+    SUM(tk.passenger_count)     AS total_passengers,
+    SUM(p.amount)::NUMERIC(12,2) AS total_revenue
+FROM train tr
+JOIN tickets tk
+    ON tk.schedule_train_id = tr.train_id
+JOIN payment p
+    ON p.transaction_id = tk.transaction_id
+GROUP BY tr.train_id, tr.train_name
+ORDER BY total_revenue DESC;
+
+-- 33) Show per-day revenue, transaction count, unique customers, and average ticket price.
+SELECT
+    DATE(p.payment_time)              AS payment_date,
+    COUNT(DISTINCT p.transaction_id)  AS total_transactions,
+    COUNT(DISTINCT tk.user_id)        AS unique_customers,
+    SUM(p.amount)::NUMERIC(12,2)      AS daily_revenue,
+    AVG(p.amount)::NUMERIC(10,2)      AS avg_ticket_price
+FROM payment p
+LEFT JOIN tickets tk
+    ON tk.transaction_id = p.transaction_id
+GROUP BY DATE(p.payment_time)
+ORDER BY payment_date DESC;
+
+-- 34) Rank trains by number of bookings and passengers to find the most popular services.
+SELECT
+    tr.train_id,
+    tr.train_name,
+    tr.train_type,
+    COUNT(DISTINCT tk.pnr)  AS total_bookings,
+    SUM(tk.passenger_count) AS total_passengers
+FROM train tr
+LEFT JOIN tickets tk
+    ON tk.schedule_train_id = tr.train_id
+GROUP BY tr.train_id, tr.train_name, tr.train_type
+HAVING COUNT(DISTINCT tk.pnr) > 0
+ORDER BY total_bookings DESC;
+
+-- 35) Compare payment methods by transactions, revenue, average value, and revenue share.
+SELECT
+    p.method AS payment_method,
+    COUNT(DISTINCT p.transaction_id) AS total_transactions,
+    COUNT(DISTINCT tk.user_id)       AS unique_customers,
+    SUM(p.amount)::NUMERIC(12,2)     AS total_revenue,
+    AVG(p.amount)::NUMERIC(10,2)     AS avg_transaction,
+    ROUND(
+        SUM(p.amount)::NUMERIC / NULLIF((SELECT SUM(amount) FROM payment), 0) * 100
+    , 2) AS revenue_share_percent
+FROM payment p
+LEFT JOIN tickets tk
+    ON tk.transaction_id = p.transaction_id
+GROUP BY p.method
+ORDER BY total_revenue DESC;
+
+-- 36) Summarize ticket revenue and bookings per railway zone using boarding station zones.
+SELECT
+    z.zone_id,
+    z.zone_name,
+    SUM(p.amount)::NUMERIC(12,2) AS total_revenue,
+    COUNT(DISTINCT tk.pnr)       AS total_bookings
+FROM tickets tk
+JOIN station st
+    ON st.station_id = tk.boarding_station
+JOIN division d
+    ON d.division_id = st.division_id
+JOIN zone z
+    ON z.zone_id = d.zone_id
+JOIN payment p
+    ON p.transaction_id = tk.transaction_id
+GROUP BY z.zone_id, z.zone_name
+ORDER BY total_revenue DESC;
+
+-- 37) Show daily passenger counts and a seven-day moving average to analyze trends.
+WITH daily_passengers AS (
+    SELECT
+        DATE(booking_ts)     AS booking_date,
+        SUM(passenger_count) AS total_passengers
+    FROM tickets
+    GROUP BY DATE(booking_ts)
+)
+SELECT
+    booking_date,
+    total_passengers,
+    AVG(total_passengers) OVER (
+        ORDER BY booking_date
+        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    )::NUMERIC(10,2) AS moving_avg_7d
+FROM daily_passengers
+ORDER BY booking_date;
+
+-- 38) Compute total passengers travelling each day based on schedule date.
+SELECT
+    DATE(tk.schedule_starting_ts) AS travel_date,
+    SUM(tk.passenger_count)       AS total_passengers
+FROM tickets tk
+GROUP BY DATE(tk.schedule_starting_ts)
+ORDER BY travel_date DESC;
+
+-- 39) Find trains where every coach is AC, meaning there are no non-AC coaches attached.
+SELECT
+    c.train_id,
+    t.train_name,
+    COUNT(*) AS total_coaches,
+    COUNT(*) FILTER (WHERE c.ac_flag = TRUE)  AS ac_coaches
+FROM coach c
+JOIN train t
+    ON t.train_id = c.train_id
+GROUP BY c.train_id, t.train_name
+HAVING COUNT(*) = COUNT(*) FILTER (WHERE c.ac_flag = TRUE)
+ORDER BY total_coaches DESC, c.train_id;
+
+-- 40) Compute the average fare paid per passenger for each train from tickets and payments.
+SELECT
+    tr.train_id,
+    tr.train_name,
+    ROUND(
+        SUM(p.amount) / NULLIF(SUM(tk.passenger_count), 0)
+    , 2) AS avg_fare_per_passenger
+FROM train tr
+JOIN tickets tk
+    ON tk.schedule_train_id = tr.train_id
+JOIN payment p
+    ON p.transaction_id = tk.transaction_id
+GROUP BY tr.train_id, tr.train_name
+ORDER BY avg_fare_per_passenger DESC;
+
+-- 41) Identify registered users who have made at least three distinct ticket bookings.
+SELECT
+    ru.user_id,
+    ru.name,
+    COUNT(DISTINCT tk.pnr) AS total_bookings
+FROM registered_user ru
+JOIN tickets tk
+    ON tk.user_id = ru.user_id
+GROUP BY ru.user_id, ru.name
+HAVING COUNT(DISTINCT tk.pnr) >= 3
+ORDER BY total_bookings DESC, ru.user_id;
+
+-- 42) Show staff count and average salary for each division together with its zone.
+SELECT
+    d.division_id,
+    d.division_name,
+    z.zone_name,
+    COUNT(s.staff_id)                  AS staff_count,
+    ROUND(AVG(s.salary)::NUMERIC, 2)   AS avg_salary
+FROM division d
+JOIN zone z
+    ON z.zone_id = d.zone_id
+LEFT JOIN staff s
+    ON s.division_id = d.division_id
+GROUP BY d.division_id, d.division_name, z.zone_name
+ORDER BY staff_count DESC;
+
+-- 43) List trains whose assigned locomotive currently has status 'Under Maintenance'.
+SELECT
+    t.train_id,
+    t.train_name,
+    l.loco_id,
+    l.loco_class,
+    l.status AS loco_status,
+    ms.shed_name
+FROM train t
+JOIN locomotive l
+    ON l.loco_id = t.loco_id
+LEFT JOIN maintenance_shed ms
+    ON ms.shed_id = l.shed_id
+WHERE l.status = 'Under Maintenance'
+ORDER BY t.train_id;
+
+-- 44) For each train, compute average passengers per booking to measure group sizes.
+SELECT
+    tr.train_id,
+    tr.train_name,
+    COUNT(DISTINCT tk.pnr)              AS total_bookings,
+    SUM(tk.passenger_count)             AS total_passengers,
+    ROUND(
+        (SUM(tk.passenger_count)::numeric /
+         NULLIF(COUNT(DISTINCT tk.pnr), 0))
+    , 2) AS avg_passengers_per_booking
+FROM train tr
+JOIN tickets tk
+    ON tk.schedule_train_id = tr.train_id
+GROUP BY tr.train_id, tr.train_name
+HAVING COUNT(DISTINCT tk.pnr) > 0
+ORDER BY avg_passengers_per_booking DESC, tr.train_id;
+
+-- 45) Find the top five stations with the highest average delay and number of reports.
+SELECT
+    st.station_id,
+    st.station_name,
+    st.city,
+    ROUND(AVG(lts.delay_minutes)::numeric, 2) AS avg_delay_minutes,
+    COUNT(*)                                   AS reports
+FROM live_train_status lts
+JOIN station st
+    ON st.station_id = lts.station_id
+GROUP BY st.station_id, st.station_name, st.city
+HAVING COUNT(*) > 0
+ORDER BY avg_delay_minutes DESC, reports DESC
+LIMIT 5;
+
+-- 46) Rank users by total money spent on tickets and show how many bookings they made.
+SELECT
+    ru.user_id,
+    ru.name,
+    SUM(p.amount)::NUMERIC(12,2) AS total_spent,
+    COUNT(DISTINCT tk.pnr)       AS total_bookings
+FROM registered_user ru
+JOIN tickets tk
+    ON tk.user_id = ru.user_id
+JOIN payment p
+    ON p.transaction_id = tk.transaction_id
+GROUP BY ru.user_id, ru.name
+ORDER BY total_spent DESC
+LIMIT 10;
+
+-- 47) List all trains whose routes include a specified junction station code.
+SELECT DISTINCT
+    t.train_id,
+    t.train_name,
+    r.route_name
+FROM train t
+JOIN route r
+    ON r.route_id = t.route_id
+JOIN route_station rs
+    ON rs.route_id = r.route_id
+JOIN station st
+    ON st.station_id = rs.station_id
+WHERE st.station_id = 'ST004'
+ORDER BY t.train_id;
+
+-- 48) For each zone, compute average ticket price per passenger boarding from that zone.
+SELECT
+    z.zone_id,
+    z.zone_name,
+    SUM(p.amount)::numeric(12,2)         AS total_revenue,
+    SUM(tk.passenger_count)              AS total_passengers,
+    ROUND(
+        SUM(p.amount)::numeric /
+        NULLIF(SUM(tk.passenger_count), 0)
+    , 2) AS avg_price_per_passenger
+FROM tickets tk
+JOIN payment p
+    ON p.transaction_id = tk.transaction_id
+JOIN station st
+    ON st.station_id = tk.boarding_station
+JOIN division d
+    ON d.division_id = st.division_id
+JOIN zone z
+    ON z.zone_id = d.zone_id
+GROUP BY z.zone_id, z.zone_name
+ORDER BY avg_price_per_passenger DESC;
+
+-- 49) List all upcoming schedules for a given train with source and destination station names.
+SELECT
+    sch.train_id,
+    t.train_name,
+    sch.starting_ts    AS departure_time,
+    sch.ending_ts      AS arrival_time,
+    src.station_name   AS source_station,
+    dst.station_name   AS destination_station,
+    sch.status
+FROM schedule sch
+JOIN train t
+    ON t.train_id = sch.train_id
+JOIN station src
+    ON src.station_id = sch.source_station_id
+JOIN station dst
+    ON dst.station_id = sch.destination_station_id
+WHERE sch.train_id = 'TR019'
+  AND sch.starting_ts > CURRENT_TIMESTAMP
+ORDER BY sch.starting_ts;
+
+-- 50) For a given train, show each coach with total seats and how many seats exist in the seat table.
+SELECT
+    c.train_id,
+    t.train_name,
+    c.coach_code,
+    c.coach_type,
+    c.total_seats AS seats_configured,
+    COUNT(s.seat_number) AS seats_defined
+FROM coach c
+JOIN train t
+    ON t.train_id = c.train_id
+LEFT JOIN seat s
+    ON s.train_id = c.train_id
+   AND s.coach_code = c.coach_code
+WHERE c.train_id = 'TR001'
+GROUP BY c.train_id, t.train_name, c.coach_code, c.coach_type, c.total_seats
+ORDER BY c.coach_code;
